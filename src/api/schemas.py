@@ -7,3 +7,9 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     bot_response: str
+
+class AdminPrompt(BaseModel):
+    prompt_text: str
+
+class AdminData(BaseModel):
+    json_data: str    
