@@ -1,7 +1,14 @@
-from fastapi import APIRouter
-from src.api.schemas import ChatRequest, ChatResponse
+from fastapi import APIRouter, HTTPException
+import json
+
+# ഇവിടെ പുതിയ Admin ക്ലാസുകൾ കൂടി ചേർത്തു
+from src.api.schemas import ChatRequest, ChatResponse, AdminPrompt, AdminData
 from src.memory.retriever import retrieve_faq_context
 from src.brain.client import ask_ai_model
+
+router = APIRouter()
+
+# ... (ഇതിന് താഴെയുള്ള നിങ്ങളുടെ ബാക്കി കോഡ് അതുപോലെ തന്നെ നിലനിർത്തുക) ...
 
 router = APIRouter()
 
