@@ -1,0 +1,10 @@
+# add to docker-compose.yml
+services:
+  postgres:
+    image: pgvector/pgvector:pg16   # includes pgvector pre-installed
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent_db
+    ports:
+      - "5432:5432"
