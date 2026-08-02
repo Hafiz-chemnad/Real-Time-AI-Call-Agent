@@ -7,4 +7,17 @@ services:
       POSTGRES_PASSWORD: agent
       POSTGRES_DB: agent_db
     ports:
-      - "5432:5432"
+      - "5432:5432"   
+
+  langfuse-server: # Notice the 2-space indentation here
+    image: langfuse/langfuse:2
+    depends_on:
+      - postgres
+    ports:
+      - "3001:3000"
+    environment:
+      - DATABASE_URL=postgresql://agent:agent@postgres:5432/agent_db
+      - NEXTAUTH_SECRET=my_super_secret_key
+      - SALT=my_super_secret_salt
+      - TELEMETRY_ENABLED=false
+      - NEXTAUTH_URL=http://localhost:3001

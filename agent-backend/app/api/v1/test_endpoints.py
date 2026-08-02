@@ -42,10 +42,14 @@ async def llm_ping(payload: PingRequest):
     }
 
 
+
+
+# in app/api/v1/test_endpoints.py
+
 class ProcessTurnRequest(BaseModel):
     transcript: str
-
+    session_state: dict = {}
 
 @router.post("/process-turn")
 async def test_process_turn(payload: ProcessTurnRequest):
-    return await process_turn(payload.transcript)
+    return await process_turn(payload.transcript, payload.session_state)

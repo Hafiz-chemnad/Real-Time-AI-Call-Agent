@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from app.api.v1 import test_endpoints
+import app.core.logging
 
 app = FastAPI(title="Agent - AI Call Receptionist Platform")
 

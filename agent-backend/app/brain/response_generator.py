@@ -2,6 +2,18 @@ from typing import List, Dict, Optional
 
 from app.brain.gateway import call_llm
 
+NO_HALLUCINATION_WITH_KNOWLEDGE = (
+    "\n\nOnly use the information above to answer. If the caller asks something "
+    "not covered by this information, say you're not sure and that you'll have "
+    "someone follow up with them — never guess, invent, or assume details."
+)
+
+NO_HALLUCINATION_NO_KNOWLEDGE = (
+    "\n\nYou don't have specific business information available for this "
+    "question. Say you're not sure and that you'll have someone follow up — "
+    "never guess or make up details about hours, pricing, policies, or services."
+)
+
 
 class ResponseGenerator:
     """
@@ -21,6 +33,9 @@ class ResponseGenerator:
 
         if knowledge:
             prompt += f"\n\nBusiness Knowledge:\n{knowledge}"
+            prompt += NO_HALLUCINATION_WITH_KNOWLEDGE
+        else:
+            prompt += NO_HALLUCINATION_NO_KNOWLEDGE
 
         return prompt
 

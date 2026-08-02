@@ -1,0 +1,18 @@
+[
+  {
+    "question": "Do you accept Cigna insurance?",
+    "ground_truth": "Yes, we accept Delta Dental and Cigna insurance."
+  },
+  {
+    "question": "Are you open on Sundays?",
+    "ground_truth": "No, we are closed on Sundays."
+  },
+  {
+    "question": "How much notice do I need to cancel an appointment?",
+    "ground_truth": "Cancellations require 24 hours notice."
+  },
+  {
+    "question": "What are your business hours on Saturday?",
+    "ground_truth": "We are open on Saturday from 10am to 2pm."
+  }
+]
