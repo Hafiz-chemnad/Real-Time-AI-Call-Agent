@@ -3,3 +3,8 @@ uvicorn[standard]
 pydantic-settings
 python-dotenv
 litellm
+elevenlabs
+cartesia
+kokoro-onnx
+onnxruntime
+numpy
