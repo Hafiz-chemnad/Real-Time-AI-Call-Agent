@@ -9,6 +9,18 @@ from alembic import context
 # access to the values within the .ini file in use.
 import os
 from dotenv import load_dotenv
+# Import your declarative Base and ALL of your models so Alembic can see them
+from app.db.base import Base
+from app.models.business import Business
+from app.models.prompt import Prompt
+from app.models.guardrail import Guardrail
+from app.models.tool import Tool
+from app.models.knowledge_base import KnowledgeBase
+
+# If you already created a CallLog model, uncomment the next line:
+# from app.models.call_log import CallLog
+
+
 
 load_dotenv()
 config = context.config
@@ -23,7 +35,7 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
-target_metadata = None
+target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

@@ -1,49 +1,97 @@
 # app/brain/orchestrator.py
 
-from typing import Optional
+import json
+import logging
+import time
+from typing import Optional, Any
 
 from app.brain.gateway import call_llm
-from app.brain.router import get_model_for_task
-from app.brain.intent_classifier import classify_intent
-from app.brain.response_generator import generate_response
-from app.brain.tool_decision import decide_tool_call, decide_correction
-from app.brain.guardrails.escalation import check_escalation, get_escalation_response
 from app.brain.guardrails.prompt_guardrails import validate_prompt
-from app.brain.guardrails.confirmation import (
-    create_booking_confirmation,
-    classify_confirmation_reply,
-)
+from app.brain.guardrails.escalation import check_escalation, get_escalation_response
+from app.brain.guardrails.confirmation import classify_confirmation_reply
+from app.brain.tool_decision import _build_tool_schema, decide_correction
 from app.knowledge.selector import get_context
 from app.tools.execution.executor import execute_tool
 from app.observability.langfuse_tracer import trace_turn
+from app.domain.business_config import get_full_business_context
+
+logger = logging.getLogger(__name__)
+
+
+def _timed(label: str):
+    start = time.perf_counter()
+    def _end():
+        print(f"⏱️  [{label}] {time.perf_counter() - start:.2f}s")
+    return _end
+
+
+def _safe_trace(**kwargs):
+    try:
+        trace_turn(**kwargs)
+    except Exception:
+        pass
+
 
 SYSTEM_PROMPT = (
-    "You are a friendly, professional receptionist answering calls for a business. "
-    "Keep responses short and conversational, like a real front-desk person would speak "
-    "on the phone — not an essay. Usually 1-2 sentences. No headers, no bullet points, "
-    "no markdown formatting. Just talk naturally."
+    "You are a friendly, professional voice receptionist answering a phone call for a business.\n"
+    "CRITICAL PHONE RULES:\n"
+    "1. Keep responses short and conversational (usually 1-2 concise sentences).\n"
+    "2. Ask ONE question or make ONE statement, then STOP and wait for the caller to speak.\n"
+    "3. NEVER answer your own questions or predict the caller's next reply.\n"
+    "4. No markdown, asterisks, bullet points, or special characters.\n"
 )
 
-# Hardcoded sample knowledge for Milestone 1 testing — Milestone 3 replaces
-# this with per-business content loaded from Postgres.
-SAMPLE_KNOWLEDGE = [
-    "Business hours: Monday-Friday 9am-6pm, Saturday 10am-2pm, closed Sundays.",
-    "We accept Delta Dental and Cigna insurance.",
-    "Cancellations require 24 hours notice.",
-]
+
+def _format_args(args_dict: dict) -> str:
+    return ", ".join([f"{k.replace('_', ' ').title()}: {v}" for k, v in args_dict.items() if not k.startswith("_")])
 
 
-async def process_turn(transcript: str, session_state: Optional[dict] = None) -> dict:
-    """
-    Processes one caller turn end to end.
+def _tool_requires_confirmation(tool_name: str, business_tools: list) -> bool:
+    matched_tool = next((t for t in business_tools if t.tool_name == tool_name), None)
+    if matched_tool is None:
+        return True
+    return bool(getattr(matched_tool, "requires_confirmation", True))
 
-    session_state carries anything that needs to persist across turns for
-    this caller — currently just a pending booking confirmation, if any.
-    Pass back whatever this function returns as `session_state` on the
-    caller's NEXT turn, so multi-turn flows (like booking confirmation) work.
-    """
+
+def _build_system_prompt(context: dict) -> str:
+    db_prompt = context.get("system_prompt", "")
+    base = SYSTEM_PROMPT
+    if db_prompt and db_prompt.strip():
+        base = SYSTEM_PROMPT + f"\n--- BUSINESS INSTRUCTIONS ---\n{db_prompt.strip()}"
+
+    guardrails = context.get("guardrails")
+    if guardrails:
+        if guardrails.scope:
+            base += f"\n[SCOPE]: {guardrails.scope}"
+            if guardrails.out_of_scope_response:
+                base += f"\nIf asked outside this scope, reply with: '{guardrails.out_of_scope_response}'"
+        if guardrails.never_reveal:
+            base += f"\n[SECRETS - NEVER REVEAL]: {', '.join(guardrails.never_reveal)}."
+        if guardrails.no_hallucination_instruction:
+            base += f"\n[ACCURACY]: {guardrails.no_hallucination_instruction}"
+
+    return base
+
+
+async def process_turn(
+    transcript: str,
+    session_state: Optional[dict] = None,
+    business_id: str = "11111111-1111-1111-1111-111111111111"
+) -> dict:
+    """Processes one caller turn end-to-end with low-latency single-pass LLM reasoning."""
+
+    # 1. Fetch Business Context
+    _t_ctx = _timed("get_full_business_context")
+    context = await get_full_business_context(business_id)
+    _t_ctx()
+
+    system_prompt = _build_system_prompt(context)
+    business_tools = context.get("tools", [])
+    custom_escalations = context.get("guardrails").escalate_on if context.get("guardrails") else None
+
     session_state = session_state or {}
-    pending_booking = session_state.get("pending_booking")
+    pending_tool_call = session_state.get("pending_tool_call")
+    chat_history = session_state.get("chat_history", [])
 
     result = {
         "transcript": transcript,
@@ -51,213 +99,191 @@ async def process_turn(transcript: str, session_state: Optional[dict] = None) ->
         "escalation": None,
         "tool_called": None,
         "response": None,
-        "session_state": {},  # what to pass back in on the next turn
+        "session_state": {},
     }
-    # ... right before returning the result in ANY of the steps ...
 
-    # STEP 0 — Security: Prompt Injection Guardrail Pre-Check
-    # ---------------------------------------------------------------
+    def _updated_history(user_msg: str, ai_msg: str) -> list:
+        return (chat_history + [
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": ai_msg},
+        ])[-6:]
+
+    # 2. Instant Prompt Guardrail Check
     guardrail_check = validate_prompt(transcript)
     if not guardrail_check["safe"]:
         result["escalation"] = "prompt_injection"
-        result["response"] = (
-            "I can only help with business inquiries, scheduling, and standard questions."
-        )
-        trace_turn(
-            transcript=result["transcript"],
-            response=result["response"],
-            intent=result.get("intent"),
-            escalation=result.get("escalation"),
-            tool_called=result.get("tool_called"),
-        )
+        result["response"] = "I can only help with business inquiries, scheduling, and standard questions."
+        _safe_trace(**result)
         return result
-    # ---------------------------------------------------------------
-    # STEP 1 — Escalation check runs FIRST and short-circuits everything.
-    # This is deliberate priority: a frustrated/human-request/off-topic
-    # message should never fall through to booking or knowledge logic.
-    # ---------------------------------------------------------------
-    escalation_category = await check_escalation(transcript)
+
+    # 3. Instant Regex Escalation Pre-check
+    escalation_category = await check_escalation(transcript, custom_escalations, chat_history)
     if escalation_category != "none":
         result["escalation"] = escalation_category
         result["response"] = get_escalation_response(escalation_category)
-        # Escalation clears any pending booking — start fresh after a handoff.
-        trace_turn(
-        transcript=result["transcript"],
-        response=result["response"],
-        intent=result.get("intent"),
-        escalation=result.get("escalation"),
-        tool_called=result.get("tool_called")
-        )
+        _safe_trace(**result)
         return result
 
-    # ---------------------------------------------------------------
-    # STEP 2 — If a booking confirmation is pending, this turn is the
-    # caller's reply to "is that right?" — handle it before anything else.
-    # ---------------------------------------------------------------
-    if pending_booking:
+    # 4. Handle Pending Tool Confirmations
+    if pending_tool_call:
         reply_type = classify_confirmation_reply(transcript)
 
         if reply_type == "confirmed":
-            tool_result = await execute_tool("request_booking", pending_booking)
-            result["tool_called"] = tool_result
-            result["response"] = (
-                f"Great, you're all set for {pending_booking['service']} on "
-                f"{pending_booking['date']} at {pending_booking['time']}!"
-            )
-            trace_turn(
-            transcript=result["transcript"],
-            response=result["response"],
-            intent=result.get("intent"),
-            escalation=result.get("escalation"),
-            tool_called=result.get("tool_called")
-            )
-            return result  # session_state stays empty — booking is done
+            tool_name = pending_tool_call.get("_tool_name")
+            _t_exec = _timed("execute_tool (confirmed)")
+            
+            try:
+                tool_result = await execute_tool(tool_name, pending_tool_call, business_tools)
+                _t_exec()
+                
+                # ✅ GRACEFUL ERROR HANDLING FOR CONFIRMED TOOLS
+                if isinstance(tool_result, dict) and tool_result.get("status") == "error":
+                    result["tool_called"] = tool_result
+                    result["response"] = (
+                        "I'm having a little trouble connecting to our system right now. "
+                        "I have noted your request and will have a team member follow up with you to confirm."
+                    )
+                else:
+                    result["tool_called"] = tool_result
+                    result["response"] = f"Great, you're all set! I have processed your request for {tool_name.replace('_', ' ')}."
+            except Exception as e:
+                _t_exec()
+                logger.error(f"Tool execution exception: {e}")
+                result["response"] = "I'm having a little trouble connecting to our system right now. Let me have someone follow up with you."
+
+            result["session_state"] = {"chat_history": _updated_history(transcript, result["response"])}
+            _safe_trace(**result)
+            return result
 
         if reply_type == "rejected":
-            result["response"] = "No problem, let me know if you'd like to book something else."
-            trace_turn(
-            transcript=result["transcript"],
-            response=result["response"],
-            intent=result.get("intent"),
-            escalation=result.get("escalation"),
-            tool_called=result.get("tool_called")
-            )
-            return result  # clear pending booking
+            result["response"] = "No problem. Let me know if you would like help with anything else."
+            result["session_state"] = {"chat_history": _updated_history(transcript, result["response"])}
+            _safe_trace(**result)
+            return result
 
         if reply_type == "correction":
-            # Caller changed just one detail (e.g. "actually make it
-            # Wednesday at 4"). Merge whatever they mentioned onto the
-            # EXISTING pending_booking rather than re-extracting a whole new
-            # request from scratch — the old approach called decide_tool_call
-            # on the bare correction text, which has no service/date/time of
-            # its own most of the time, and produced "service": "unknown"
-            # placeholders instead of keeping the original service.
-            merged_decision = await decide_correction(transcript, pending_booking)
-            if merged_decision:
-                booking = merged_decision["arguments"]
-                result["response"] = create_booking_confirmation(
-                    booking["service"], booking["date"], booking["time"]
-                )
-                result["session_state"] = {"pending_booking": booking}
-                trace_turn(
-                transcript=result["transcript"],
-                response=result["response"],
-                intent=result.get("intent"),
-                escalation=result.get("escalation"),
-                tool_called=result.get("tool_called")
-                )
+            _t_corr = _timed("decide_correction")
+            merged = await decide_correction(transcript, pending_tool_call, business_tools)
+            _t_corr()
+            if merged:
+                updated = merged["arguments"]
+                result["response"] = f"Got it. The updated details are — {_format_args(updated)}. Shall I proceed with this?"
+                result["session_state"] = {
+                    "pending_tool_call": updated,
+                    "chat_history": _updated_history(transcript, result["response"]),
+                }
+                _safe_trace(**result)
                 return result
-            # Couldn't extract anything usable from the correction — ask
-            # again, but keep the existing pending booking intact rather
-            # than discarding it.
-            result["response"] = (
-                "Sorry, what would you like to change it to?"
-            )
-            result["session_state"] = {"pending_booking": pending_booking}
-            trace_turn(
-            transcript=result["transcript"],
-            response=result["response"],
-            intent=result.get("intent"),
-            escalation=result.get("escalation"),
-            tool_called=result.get("tool_called")
-            )
+            result["response"] = "Sorry, what would you like to change it to?"
+            result["session_state"] = {
+                "pending_tool_call": pending_tool_call,
+                "chat_history": _updated_history(transcript, result["response"]),
+            }
+            _safe_trace(**result)
             return result
 
-        # ambiguous — re-ask rather than guessing
-        result["response"] = (
-            f"Sorry, just to confirm — {pending_booking['service']} on "
-            f"{pending_booking['date']} at {pending_booking['time']}, is that a yes?"
-        )
-        result["session_state"] = {"pending_booking": pending_booking}
-        trace_turn(
-        transcript=result["transcript"],
-        response=result["response"],
-        intent=result.get("intent"),
-        escalation=result.get("escalation"),
-        tool_called=result.get("tool_called")
-        )
+        result["response"] = f"Just to confirm, shall I proceed with {_format_args(pending_tool_call)}?"
+        result["session_state"] = {
+            "pending_tool_call": pending_tool_call,
+            "chat_history": _updated_history(transcript, result["response"]),
+        }
+        _safe_trace(**result)
         return result
 
-    # ---------------------------------------------------------------
-    # STEP 3 — No escalation, no pending confirmation: classify intent.
-    # ---------------------------------------------------------------
-    intent_result = await classify_intent(transcript)
-    intent = intent_result["intent"]
-    result["intent"] = intent
+    # 5. Retrieve Context Knowledge (FAQ / Business Info)
+    db_knowledge = context.get("knowledge")
+    if db_knowledge:
+        knowledge_text = await get_context(transcript, [db_knowledge], business_id=business_id)
+        if knowledge_text:
+            system_prompt += f"\n\n--- BUSINESS KNOWLEDGE ---\n{knowledge_text}"
 
-    # ---------------------------------------------------------------
-    # STEP 4a — Booking-type intent: try to extract a complete request.
-    # ---------------------------------------------------------------
-    if intent == "booking":
-        decision = await decide_tool_call(transcript)
-        if decision:
-            booking = decision["arguments"]
-            result["response"] = create_booking_confirmation(
-                booking["service"], booking["date"], booking["time"]
-            )
-            result["session_state"] = {"pending_booking": booking}
-            trace_turn(
-            transcript=result["transcript"],
-            response=result["response"],
-            intent=result.get("intent"),
-            escalation=result.get("escalation"),
-            tool_called=result.get("tool_called")
-            ) 
-            return result
-        # Intent says booking, but couldn't extract full details — ask for them.
-        result["response"] = await generate_response(
-            user_message=transcript,
-            base_prompt=SYSTEM_PROMPT,
-            knowledge=None,
-        )
-         
-        trace_turn(
-        transcript=result["transcript"],
-        response=result["response"],
-        intent=result.get("intent"),
-        escalation=result.get("escalation"),
-        tool_called=result.get("tool_called")
-        )
-        return result
+    # 6. Single-Pass Execution (Dialogue + Tool Decision in ONE Call)
+    tool_schemas = [_build_tool_schema(t) for t in business_tools] if business_tools else None
 
-    # ---------------------------------------------------------------
-    # STEP 4b — FAQ-type intent: look up knowledge, answer from it only.
-    # (This now also covers what used to be separate "insurance"/"pricing"/
-    # "location" intents — the classifier collapses those into
-    # faq_question, since this is the only branch wired to KB retrieval.)
-    # ---------------------------------------------------------------
-    if intent == "faq_question":
-        knowledge = get_context(transcript, SAMPLE_KNOWLEDGE)
-        result["response"] = await generate_response(
-            user_message=transcript,
-            base_prompt=SYSTEM_PROMPT,
-            knowledge=knowledge,
-        )
-        trace_turn(
-        transcript=result["transcript"],
-        response=result["response"],
-        intent=result.get("intent"),
-        escalation=result.get("escalation"),
-        tool_called=result.get("tool_called")
-        )
-        return result
+    # Construct proper multi-turn messages
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in chat_history[-4:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": transcript})
 
-    # ---------------------------------------------------------------
-    # STEP 4c — Everything else: plain conversational response.
-    # (greeting, goodbye, cancel, reschedule, ordering, order_modification,
-    #  complaint, unknown — Milestone 1 doesn't build dedicated handlers
-    #  for all of these yet; they get a normal reply for now.)
-    # ---------------------------------------------------------------
-    result["response"] = await generate_response(
-        user_message=transcript,
-        base_prompt=SYSTEM_PROMPT,
-        knowledge=None,
-    )
-    trace_turn(
-        transcript=result["transcript"],
-        response=result["response"],
-        intent=result.get("intent"),
-        escalation=result.get("escalation"),
-        tool_called=result.get("tool_called")
-    )
+    _t_llm = _timed("single_pass_llm")
+    llm_kwargs = {
+        "model_name": "fast-model",  # Uses fast Groq Llama-3.3 (300ms)
+        "messages": messages,
+        "temperature": 0.3,
+    }
+    if tool_schemas:
+        llm_kwargs["tools"] = tool_schemas
+        llm_kwargs["tool_choice"] = "auto"
+
+    response, _ = await call_llm(**llm_kwargs)
+    _t_llm()
+
+    choice = response.choices[0].message
+    tool_calls = getattr(choice, "tool_calls", None)
+
+    # If the LLM triggered a tool:
+    if tool_calls:
+        call = tool_calls[0]
+        tool_name = call.function.name
+        try:
+            call_args = json.loads(call.function.arguments)
+        except Exception:
+            call_args = {}
+
+        call_args["_tool_name"] = tool_name
+
+        # Check required fields
+        matching_tool = next((t for t in business_tools if t.tool_name == tool_name), None)
+        missing_required = False
+        if matching_tool and isinstance(matching_tool.parameters, dict):
+            required = matching_tool.parameters.get("required", [])
+            for req in required:
+                val = str(call_args.get(req, "")).lower()
+                if not val or "specify" in val or "unknown" in val:
+                    missing_required = True
+                    break
+
+        if not missing_required:
+            if _tool_requires_confirmation(tool_name, business_tools):
+                result["response"] = (
+                    f"Just to confirm, you would like me to proceed with {tool_name.replace('_', ' ')} "
+                    f"using these details — {_format_args(call_args)}. Is that correct?"
+                )
+                result["session_state"] = {
+                    "pending_tool_call": call_args,
+                    "chat_history": _updated_history(transcript, result["response"]),
+                }
+                _safe_trace(**result)
+                return result
+            else:
+                _t_exec = _timed("execute_tool (auto)")
+                try:
+                    tool_result = await execute_tool(tool_name, call_args, business_tools)
+                    _t_exec()
+                    
+                    # ✅ GRACEFUL ERROR HANDLING FOR AUTO TOOLS
+                    if isinstance(tool_result, dict) and tool_result.get("status") == "error":
+                        result["tool_called"] = tool_result
+                        result["response"] = (
+                            "I ran into a technical hiccup trying to process that automatically. "
+                            "Let me have someone follow up with you directly."
+                        )
+                    else:
+                        result["tool_called"] = tool_result
+                        result["response"] = f"Done! I have successfully processed your request for {tool_name.replace('_', ' ')}."
+                except Exception as e:
+                    _t_exec()
+                    logger.error(f"Tool execution exception: {e}")
+                    result["response"] = "I ran into a technical hiccup trying to process that automatically. Let me have someone follow up with you directly."
+
+                result["session_state"] = {"chat_history": _updated_history(transcript, result["response"])}
+                _safe_trace(**result)
+                return result
+
+    # Regular conversational response
+    reply_content = choice.content or "How can I help you today?"
+    result["response"] = reply_content.strip()
+    result["session_state"] = {"chat_history": _updated_history(transcript, result["response"])}
+    _safe_trace(**result)
     return result

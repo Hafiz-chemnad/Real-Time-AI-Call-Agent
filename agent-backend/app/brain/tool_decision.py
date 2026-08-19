@@ -3,227 +3,138 @@ import logging
 import re
 from typing import Any
 
-from pydantic import ValidationError
-
 from app.brain.router import get_model_for_task
-from app.tools.mcp.schema_builder import BookingRequest
 
 logger = logging.getLogger(__name__)
 
-_BOOKING = re.compile(r"\b(book|schedule|reserve|set up|appointment|come in)\b", re.I)
-_DATE = re.compile(
-    r"\b(today|tomorrow|(?:(?:this|next)\s+)?(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
-    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
-    r"aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?|"
-    r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b",
-    re.I,
-)
-_SERVICE = (
-    re.compile(
-        r"\b(?:book|schedule|reserve|set up|get)\s+(?:me\s+|an?\s+|my\s+)*"
-        r"(.+?)(?:\s+(?:appointment|session|visit))?\s+(?:for|on)\s+",
-        re.I,
-    ),
-    re.compile(r"\bcome in for\s+(.+?)\s+(?:for|on)\s+", re.I),
-    re.compile(
-        r"\bneed\s+(?:to book\s+)?(?:an?\s+)?(.+?)\s+(?:appointment\s+)?(?:for|on)\s+",
-        re.I,
-    ),
-)
-_TIME = re.compile(
-    r"\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)|noon|midnight|\d{1,2}:\d{2}|\d{1,2})\b",
-    re.I,
-)
-_PROMPT = (
-    'Return JSON only. Return {"is_booking":true,"service":"...","date":"...","time":"..."} '
-    "ONLY if the caller's message explicitly states all three of: what service/appointment type, "
-    "what date, and what time. If ANY of these three is not explicitly mentioned in the message, "
-    'return {"is_booking":false} — do not guess, infer, or fill in a placeholder value like '
-    '"unknown" or "general" for a missing field.'
-)
 
-# Used only for corrections to an already-pending booking — the caller may
-# mention just a new date/time/service, not a full new request. We must not
-# require all three fields here, and must not invent placeholders for the
-# ones not mentioned (that's what caused "service": "unknown" bugs before).
-_CORRECTION_PROMPT = (
-    "The caller is correcting a detail of a booking already in progress. "
-    "Return JSON only, containing ONLY the fields the caller actually "
-    'mentioned in this message — any of "service", "date", "time". '
-    "Do not include a field if it wasn't mentioned. Do not guess or invent "
-    'a value. Example: {"time":"4:00 PM"} if only the time was corrected. '
-    "If nothing usable was mentioned, return {}."
-)
+def _build_tool_schema(tool) -> dict[str, Any]:
+    """Converts a DB Tool row into an OpenAI/LiteLLM-style function schema."""
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.tool_name,
+            "description": tool.description,
+            "parameters": tool.parameters,  # stored as JSONB, already schema-shaped
+        },
+    }
 
 
 async def _call_llm(**kwargs: Any) -> tuple[Any, str]:
     from app.brain.gateway import call_llm
-
     return await call_llm(**kwargs)
 
 
-_PLACEHOLDER_VALUES = {"unknown", "n/a", "na", "tbd", "not specified", "none", "general", "unspecified"}
-
-def _validated(payload: Any) -> dict[str, Any] | None:
-    if not isinstance(payload, dict) or payload.get("is_booking") is not True:
-        return None
-    try:
-        booking = BookingRequest.model_validate(payload)
-    except ValidationError as exc:
-        logger.debug("tool_decision: LLM payload failed validation: %s", exc)
-        return None
-    values = booking.model_dump()
-    if any(v.strip().lower() in _PLACEHOLDER_VALUES for v in values.values()):
-        logger.warning("tool_decision: LLM returned placeholder value(s): %s", values)
-        return None
-    return {"tool": "request_booking", "arguments": values}
-
-
-def _parse_json_content(content: str) -> Any:
-    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content.strip(), re.S | re.I)
-    return json.loads(fenced.group(1) if fenced else content)
-
-
-def _fallback(transcript: str) -> dict[str, Any] | None:
-    if not _BOOKING.search(transcript):
-        return None
-    date = _DATE.search(transcript)
-    time = _TIME.search(transcript)
-    service = next((match for pattern in _SERVICE if (match := pattern.search(transcript))), None)
-    if not date or not time or not service:
-        return None
-    value = re.sub(
-        r"\s+(appointment|session|visit)$", "", service.group(1).strip(" ,.-"), flags=re.I
-    )
-    try:
-        booking = BookingRequest(
-            service=value,
-            date=date.group(0),
-            time=re.sub(r"^at\s+", "", time.group(0), flags=re.I),
-        )
-    except ValidationError as exc:
-        logger.debug("tool_decision: regex fallback failed validation: %s", exc)
-        return None
-    return {"tool": "request_booking", "arguments": booking.model_dump()}
-
-
-async def decide_tool_call(transcript: str) -> dict[str, Any] | None:
-    """
-    Extracts a *complete* new booking request from a transcript.
-
-    Returns a dict with a "source" field ("llm" or "regex_fallback") so
-    callers/logs can tell which extraction path actually produced the
-    result — useful for verifying whether response_format is honored by
-    the underlying provider, since failures silently fall through to regex.
-    """
-    if not isinstance(transcript, str) or not transcript.strip():
-        return None
-    try:
-        response, _ = await _call_llm(
-            model_name=get_model_for_task("classification"),
-            messages=[
-                {"role": "system", "content": _PROMPT},
-                {"role": "user", "content": transcript},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
-        content = response.choices[0].message.content
-        result = _validated(_parse_json_content(content))
-        if result:
-            result["source"] = "llm"
-            return result
-    except (AttributeError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "decide_tool_call: LLM path failed (%s: %s), falling back to regex extraction",
-            type(exc).__name__,
-            exc,
-        )
-    except Exception:
-        logger.exception(
-            "decide_tool_call: unexpected error calling LLM, falling back to regex extraction"
-        )
-
-    result = _fallback(transcript)
-    if result:
-        result["source"] = "regex_fallback"
-    return result
-
-
-async def decide_correction(
-    transcript: str, existing_booking: dict[str, Any]
+async def decide_tool_call(
+    transcript: str, business_tools: list, chat_history: list | None = None
 ) -> dict[str, Any] | None:
-    """
-    Extracts ONLY the fields the caller mentioned while correcting a booking
-    already in progress, and merges them onto `existing_booking`. Never
-    invents a value for a field that wasn't mentioned — unmentioned fields
-    keep their prior value from `existing_booking`.
+    if not isinstance(transcript, str) or not transcript.strip():
+        return None
+    if not business_tools:
+        return None
 
-    Returns the same shape as decide_tool_call: {"tool", "arguments", "source"}.
-    Returns None only if nothing usable could be merged at all (existing
-    booking is already incomplete AND nothing new was extracted).
+    tool_schemas = [_build_tool_schema(t) for t in business_tools]
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a receptionist deciding whether the caller's message "
+                "requires calling one of the available tools. Only call a tool "
+                "if the caller's request clearly matches it and you have enough "
+                "information to fill ALL its required parameters. "
+                "CRITICAL: If ANY required parameter is missing, DO NOT call the tool. "
+                "Do NOT invent placeholders like 'please specify' or 'unknown'. "
+                "Just return a normal text response."
+            ),
+        },
+    ]
+    if chat_history:
+        messages.extend(chat_history[-4:])
+    messages.append({"role": "user", "content": transcript})
+
+    try:
+        response, _ = await _call_llm(
+            model_name=get_model_for_task("classification"),
+            messages=messages,
+            tools=tool_schemas,
+            tool_choice="auto",
+            temperature=0,
+        )
+        message = response.choices[0].message
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return None
+            
+        call = tool_calls[0]
+        arguments = json.loads(call.function.arguments)
+        
+        # PYTHON SAFETY NET: Reject hallucinated placeholders
+        matching_tool = next((t for t in business_tools if t.tool_name == call.function.name), None)
+        if matching_tool and isinstance(matching_tool.parameters, dict):
+            required_fields = matching_tool.parameters.get("required", [])
+            for field in required_fields:
+                val = arguments.get(field)
+                # If it's missing, empty, or contains placeholder text, abort the tool call
+                if not val or "specify" in str(val).lower() or "unknown" in str(val).lower():
+                    logger.info(f"Missing required slot '{field}'. Letting standard response ask for it.")
+                    return None
+                    
+        return {"tool": call.function.name, "arguments": arguments}
+    except Exception:
+        logger.exception("decide_tool_call: LLM tool-calling failed")
+        return None
+
+async def decide_correction(transcript: str, pending_arguments: dict, business_tools: list) -> dict[str, Any] | None:
+    """
+    Given a caller's correction (e.g. "actually make it Wednesday at 4")
+    and the currently pending tool arguments, asks the LLM to merge the
+    correction into the existing arguments — using the same dynamic tool
+    schemas as decide_tool_call, not a hardcoded booking assumption.
     """
     if not isinstance(transcript, str) or not transcript.strip():
         return None
+    if not business_tools:
+        return None
 
-    partial: dict[str, Any] = {}
-    source = "regex_fallback"
+    tool_schemas = [_build_tool_schema(t) for t in business_tools]
+
+    # Figure out which tool this pending booking belongs to, so we can
+    # remind the LLM specifically what fields it's editing.
+    tool_name = pending_arguments.get("_tool_name")
+    matching_tool = next((t for t in business_tools if t.tool_name == tool_name), None)
 
     try:
         response, _ = await _call_llm(
             model_name=get_model_for_task("classification"),
             messages=[
-                {"role": "system", "content": _CORRECTION_PROMPT},
+                {
+                    "role": "system",
+                    "content": (
+                        "The caller previously requested this action, with these "
+                        f"current details: {json.dumps(pending_arguments)}. "
+                        "They are now correcting ONE OR MORE details. Call the same "
+                        "tool again with the corrected arguments, keeping every "
+                        "field that wasn't mentioned in the correction unchanged."
+                    ),
+                },
                 {"role": "user", "content": transcript},
             ],
-            response_format={"type": "json_object"},
+            tools=tool_schemas,
+            tool_choice={"type": "function", "function": {"name": tool_name}} if matching_tool else "auto",
             temperature=0,
         )
-        content = response.choices[0].message.content
-        parsed = _parse_json_content(content)
-        if isinstance(parsed, dict):
-            partial = {
-                k: v
-                for k, v in parsed.items()
-                if k in ("service", "date", "time") and isinstance(v, str) and v.strip()
-            }
-            source = "llm"
-    except (AttributeError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "decide_correction: LLM path failed (%s: %s), falling back to regex extraction",
-            type(exc).__name__,
-            exc,
-        )
+
+        message = response.choices[0].message
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return None
+
+        call = tool_calls[0]
+        arguments = json.loads(call.function.arguments)
+        arguments["_tool_name"] = call.function.name
+        return {"tool": call.function.name, "arguments": arguments}
+
     except Exception:
-        logger.exception(
-            "decide_correction: unexpected error calling LLM, falling back to regex extraction"
-        )
-
-    if not partial:
-        # Regex fallback: only pull whichever of date/time/service is
-        # actually present — do NOT require all three like _fallback() does,
-        # since a correction message legitimately mentions just one field.
-        date = _DATE.search(transcript)
-        time = _TIME.search(transcript)
-        service = next((m for pattern in _SERVICE if (m := pattern.search(transcript))), None)
-        if date:
-            partial["date"] = date.group(0)
-        if time:
-            partial["time"] = re.sub(r"^at\s+", "", time.group(0), flags=re.I)
-        if service:
-            partial["service"] = re.sub(
-                r"\s+(appointment|session|visit)$", "", service.group(1).strip(" ,.-"), flags=re.I
-            )
-
-    if not partial:
-        return None  # nothing usable mentioned at all
-
-    merged = {**existing_booking, **partial}
-
-    try:
-        booking = BookingRequest.model_validate(merged)
-    except ValidationError as exc:
-        logger.debug("decide_correction: merged booking failed validation: %s", exc)
-        return None
-
-    return {"tool": "request_booking", "arguments": booking.model_dump(), "source": source}
+        logger.exception("decide_correction: LLM correction merge failed")
+        return None        

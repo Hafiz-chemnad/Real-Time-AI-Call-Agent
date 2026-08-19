@@ -3,3 +3,53 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Backup/zip artifacts — never commit these
+*.zip
+
+# Test/debug artifacts
+*.wav
+call_log.txt
+stt_service_source.txt
+kokoro_help.txt
+
+# Model weight files — too large, don't belong in git
+*.pth
+*.onnx
+
+# Node
+node_modules/
+node_modulesA/
+node_modulesB/
+.next/
+out/
+
+# Frontend build artifacts
+dist/
+build/
+.turbo/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local databases
+*.sqlite3
+*.db
+
+# Docker local overrides
+docker-compose.override.yml
+# Ignore local TTS model weights
+agent-backend/app/tts/models/

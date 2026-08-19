@@ -6,10 +6,13 @@ from app.core.config import settings
 litellm.cache = litellm.Cache(type="local")
 
 # Model list — maps a friendly name to the actual provider/model + credentials
+# Model list — maps a friendly name to the actual provider/model + credentials
+# Model list — maps a friendly name to the actual provider/model + credentials
+# Model list — maps a friendly name to the actual provider/model + credentials
 model_list = [
     {
         "model_name": "fast-model",
-        "litellm_params": {"model": "groq/llama-3.3-70b-versatile", "api_key": settings.GROQ_API_KEY},
+        "litellm_params": {"model": "groq/openai/gpt-oss-120b", "api_key": settings.GROQ_API_KEY}, # ✅ Official 70B replacement
     },
     {
         "model_name": "main-model",
@@ -17,7 +20,7 @@ model_list = [
     },
     {
         "model_name": "fallback-model",
-        "litellm_params": {"model": "groq/llama-3.1-8b-instant", "api_key": settings.GROQ_API_KEY},
+        "litellm_params": {"model": "groq/openai/gpt-oss-20b", "api_key": settings.GROQ_API_KEY}, # ✅ Official 8B replacement
     },
 ]
 

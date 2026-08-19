@@ -16,6 +16,7 @@ def trace_turn(
     escalation: Optional[str] = None, 
     tool_called: Optional[Dict[str, Any]] = None
 ):
+    
     """
     Logs a single conversation turn to Langfuse using the standard client interface.
     """
