@@ -51,8 +51,6 @@ async def validate_twilio_request(request: Request):
         print("🚨 SECURITY ALERT: Rejected invalid Twilio signature!")
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
-# ✅ FIX 1: Add business_id to the inbound route path
-# ✅ FIX 1: Add business_id to the inbound route path
 @router.post("/twilio/inbound/{business_id}")
 async def handle_incoming_call(
     business_id: str,
@@ -60,7 +58,6 @@ async def handle_incoming_call(
     _: None = Depends(validate_twilio_request),
 ):
     host = request.headers.get("host")
-    # ✅ FIX 2: Pass the business_id directly into the WebSocket URL
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Connect>
@@ -70,11 +67,10 @@ async def handle_incoming_call(
     """
     return Response(content=twiml, media_type="application/xml")
 
-# ✅ FIX 3: Accept business_id in the websocket endpoint
 @router.websocket("/ws/twilio/{business_id}")
 async def twilio_ws_endpoint(websocket: WebSocket, business_id: str):
     await websocket.accept()
-    call_sid = None  # so the finally block below is always safe to reference
+    call_sid = None  
 
     try:
         start_data = None
@@ -104,11 +100,15 @@ async def twilio_ws_endpoint(websocket: WebSocket, business_id: str):
             stream_sid=stream_sid,
             account_sid=account_sid,
             auth_token=auth_token,
-            call_sid=call_sid
+            call_sid=call_sid,
+            params=TwilioFrameSerializer.InputParams(auto_hang_up=False)
         )
 
         vad_analyzer = SileroVADAnalyzer(params=VADParams(
-            confidence=0.7, start_secs=0.2, stop_secs=0.8, min_volume=0.2,
+            confidence=0.7, 
+            start_secs=0.2, 
+            stop_secs=0.8, 
+            min_volume=0.08,  # Increased mic sensitivity for Twilio audio streams[cite: 10]
         ))
 
         transport = FastAPIWebsocketTransport(
@@ -132,6 +132,4 @@ async def twilio_ws_endpoint(websocket: WebSocket, business_id: str):
     except Exception as e:
         print(f"Fatal error in Twilio WebSocket: {e}")
     finally:
-        # call_sid is None if the socket closed before 'start' ever arrived
-        # (e.g. an immediate hangup) — safe to print either way now.
         print(f"Cleaning up resources for call {call_sid or 'unknown (no start event received)'}")

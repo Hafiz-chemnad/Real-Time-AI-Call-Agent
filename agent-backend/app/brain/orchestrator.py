@@ -15,6 +15,8 @@ from app.tools.execution.executor import execute_tool
 from app.observability.langfuse_tracer import trace_turn
 from app.domain.business_config import get_full_business_context
 
+from app.core.language import is_malayalam_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,7 +82,6 @@ async def process_turn(
 ) -> dict:
     """Processes one caller turn end-to-end with low-latency single-pass LLM reasoning."""
 
-    # 1. Fetch Business Context
     _t_ctx = _timed("get_full_business_context")
     context = await get_full_business_context(business_id)
     _t_ctx()
@@ -92,6 +93,28 @@ async def process_turn(
     session_state = session_state or {}
     pending_tool_call = session_state.get("pending_tool_call")
     chat_history = session_state.get("chat_history", [])
+
+    # Turn-1 Language Lock
+    if not chat_history and "call_language" not in session_state:
+        session_state["call_language"] = "ml" if is_malayalam_text(transcript) else "en"
+    
+    call_language = session_state.get("call_language", "en")
+
+    call_language = session_state.get("call_language", "en")
+
+    if call_language == "ml":
+        system_prompt += (
+            "\n\n[CRITICAL LANGUAGE RULE]: You are a Malayalam AI assistant. You MUST strictly reply in Malayalam. "
+            "Under absolutely NO circumstances should you generate responses in Hindi, Bengali, Gujarati, or any other language, "
+            "even if the user transcript appears to be in those languages. Ignore unintelligible text. "
+            "Do NOT use English unless citing a specific brand name."
+        )
+    else:
+        system_prompt += (
+            "\n\n[CRITICAL LANGUAGE RULE]: You are an English AI assistant. You MUST strictly reply in English. "
+            "Under absolutely NO circumstances should you generate responses in Hindi, Bengali, Gujarati, or any other language, "
+            "even if the user transcript appears to be in those languages. Ignore unintelligible text."
+        )
 
     result = {
         "transcript": transcript,
@@ -108,25 +131,52 @@ async def process_turn(
             {"role": "assistant", "content": ai_msg},
         ])[-6:]
 
-    # 2. Instant Prompt Guardrail Check
+    def _save_state(**kwargs):
+        session_state.update(kwargs)
+        result["session_state"] = session_state
+
+    # Bilingual Prompt Injection Handling
+    # Bilingual Prompt Injection Handling
     guardrail_check = validate_prompt(transcript)
     if not guardrail_check["safe"]:
         result["escalation"] = "prompt_injection"
-        result["response"] = "I can only help with business inquiries, scheduling, and standard questions."
+        if call_language == "ml":
+            result["response"] = "ക്ഷമിക്കണം, ബിസിനസ്സ് സംബന്ധമായ കാര്യങ്ങൾക്കും ബുക്കിംഗുകൾക്കും മാത്രമേ എനിക്ക് സഹായിക്കാൻ കഴിയൂ."
+        else:
+            result["response"] = "I can only help with business inquiries, scheduling, and standard questions."
+        
+        # FIX 1: Save state so it doesn't wipe memory on prompt injection
+        _save_state(chat_history=_updated_history(transcript, result["response"]))
         _safe_trace(**result)
         return result
 
-    # 3. Instant Regex Escalation Pre-check
+    # Bilingual Escalation Handling
     escalation_category = await check_escalation(transcript, custom_escalations, chat_history)
     if escalation_category != "none":
         result["escalation"] = escalation_category
-        result["response"] = get_escalation_response(escalation_category)
+        eng_response = get_escalation_response(escalation_category)
+        
+        if call_language == "ml":
+            if escalation_category == "human_request":
+                result["response"] = "തീർച്ചയായും, ഞാൻ നിങ്ങളെ ഒരു കസ്റ്റമർ കെയർ എക്സിക്യൂട്ടീവിന് കണക്ട് ചെയ്യാം."
+            elif escalation_category == "frustration":
+                result["response"] = "ക്ഷമിക്കണം, ഉണ്ടായ അസൗകര്യത്തിൽ ഞാൻ മാപ്പ് ചോദിക്കുന്നു. ഞാൻ നിങ്ങളെ ഒരു പ്രതിനിധിക്ക് കണക്ട് ചെയ്യാം."
+            elif escalation_category == "off_topic":
+                # FIX 2: Correct translation so it stops saying it's transferring you!
+                result["response"] = "ക്ഷമിക്കണം, എനിക്ക് ക്ലിനിക്കിന്റെ സേവനങ്ങൾക്കും ബുക്കിംഗുകൾക്കും മാത്രമേ സഹായിക്കാൻ കഴിയൂ."
+            else:
+                result["response"] = "ക്ഷമിക്കണം, എനിക്ക് ഇതിൽ സഹായിക്കാൻ കഴിയില്ല. ഞാൻ നിങ്ങളെ ഒരു പ്രതിനിധിക്ക് കണക്ട് ചെയ്യാം."
+        else:
+            result["response"] = eng_response
+            
+        # FIX 3: Save state so it doesn't wipe memory when STT hallucinates off_topic noise
+        _save_state(chat_history=_updated_history(transcript, result["response"]))
         _safe_trace(**result)
         return result
 
-    # 4. Handle Pending Tool Confirmations
+    # 3-Tier Confirmation Handling
     if pending_tool_call:
-        reply_type = classify_confirmation_reply(transcript)
+        reply_type = await classify_confirmation_reply(transcript, call_language=call_language)
 
         if reply_type == "confirmed":
             tool_name = pending_tool_call.get("_tool_name")
@@ -136,28 +186,42 @@ async def process_turn(
                 tool_result = await execute_tool(tool_name, pending_tool_call, business_tools)
                 _t_exec()
                 
-                # ✅ GRACEFUL ERROR HANDLING FOR CONFIRMED TOOLS
                 if isinstance(tool_result, dict) and tool_result.get("status") == "error":
                     result["tool_called"] = tool_result
-                    result["response"] = (
-                        "I'm having a little trouble connecting to our system right now. "
-                        "I have noted your request and will have a team member follow up with you to confirm."
-                    )
+                    if call_language == "ml":
+                        result["response"] = (
+                            "ക്ഷമിക്കണം, സിസ്റ്റവുമായി ബന്ധിപ്പിക്കുന്നതിൽ ഒരു ചെറിയ തകരാർ ഉണ്ട്. "
+                            "നിങ്ങളുടെ വിവരങ്ങൾ ഞാൻ രേഖപ്പെടുത്തിയിട്ടുണ്ട്, ഒരാൾ നിങ്ങളെ തിരികെ വിളിക്കുന്നതാണ്."
+                        )
+                    else:
+                        result["response"] = (
+                            "I'm having a little trouble connecting to our system right now. "
+                            "I have noted your request and will have a team member follow up with you to confirm."
+                        )
                 else:
                     result["tool_called"] = tool_result
-                    result["response"] = f"Great, you're all set! I have processed your request for {tool_name.replace('_', ' ')}."
+                    if call_language == "ml":
+                        result["response"] = "ശരി, എല്ലാം തയ്യാറാണ്! നിങ്ങളുടെ ബുക്കിംഗ് വിജയകരമായി പൂർത്തിയായി."
+                    else:
+                        result["response"] = f"Great, you're all set! I have processed your request for {tool_name.replace('_', ' ')}."
             except Exception as e:
                 _t_exec()
                 logger.error(f"Tool execution exception: {e}")
-                result["response"] = "I'm having a little trouble connecting to our system right now. Let me have someone follow up with you."
+                if call_language == "ml":
+                    result["response"] = "ക്ഷമിക്കണം, സിസ്റ്റവുമായി ബന്ധിപ്പിക്കുന്നതിൽ ഒരു ചെറിയ തകരാർ ഉണ്ട്. ഒരാൾ നിങ്ങളെ ഉടൻ തിരികെ വിളിക്കുന്നതാണ്."
+                else:
+                    result["response"] = "I'm having a little trouble connecting to our system right now. Let me have someone follow up with you."
 
-            result["session_state"] = {"chat_history": _updated_history(transcript, result["response"])}
+            _save_state(chat_history=_updated_history(transcript, result["response"]), pending_tool_call=None)
             _safe_trace(**result)
             return result
 
         if reply_type == "rejected":
-            result["response"] = "No problem. Let me know if you would like help with anything else."
-            result["session_state"] = {"chat_history": _updated_history(transcript, result["response"])}
+            if call_language == "ml":
+                result["response"] = "ശരി കുഴപ്പമില്ല. വേറെ എന്തെങ്കിലും സഹായം ആവശ്യമുണ്ടോ?"
+            else:
+                result["response"] = "No problem. Let me know if you would like help with anything else."
+            _save_state(chat_history=_updated_history(transcript, result["response"]), pending_tool_call=None)
             _safe_trace(**result)
             return result
 
@@ -167,40 +231,55 @@ async def process_turn(
             _t_corr()
             if merged:
                 updated = merged["arguments"]
-                result["response"] = f"Got it. The updated details are — {_format_args(updated)}. Shall I proceed with this?"
-                result["session_state"] = {
-                    "pending_tool_call": updated,
-                    "chat_history": _updated_history(transcript, result["response"]),
-                }
+                if call_language == "ml":
+                    result["response"] = f"ശരി. പുതിയ വിവരങ്ങൾ ഇതാണ് — {_format_args(updated)}. ഞാൻ മുന്നോട്ട് പോകട്ടേ?"
+                else:
+                    result["response"] = f"Got it. The updated details are — {_format_args(updated)}. Shall I proceed with this?"
+                _save_state(pending_tool_call=updated, chat_history=_updated_history(transcript, result["response"]))
                 _safe_trace(**result)
                 return result
-            result["response"] = "Sorry, what would you like to change it to?"
-            result["session_state"] = {
-                "pending_tool_call": pending_tool_call,
-                "chat_history": _updated_history(transcript, result["response"]),
-            }
+                
+            if call_language == "ml":
+                result["response"] = "ക്ഷമിക്കണം, ഇതിൽ എന്താണ് മാറ്റേണ്ടത്?"
+            else:
+                result["response"] = "Sorry, what would you like to change it to?"
+            _save_state(chat_history=_updated_history(transcript, result["response"]))
             _safe_trace(**result)
             return result
 
-        result["response"] = f"Just to confirm, shall I proceed with {_format_args(pending_tool_call)}?"
-        result["session_state"] = {
-            "pending_tool_call": pending_tool_call,
-            "chat_history": _updated_history(transcript, result["response"]),
-        }
+        # Ambiguous fallback
+        if call_language == "ml":
+            result["response"] = f"ക്ഷമിക്കണം, എനിക്ക് വ്യക്തമായില്ല. {_format_args(pending_tool_call)} ഉപയോഗിച്ച് ഞാൻ മുന്നോട്ട് പോകട്ടേ?"
+        else:
+            result["response"] = f"Just to confirm, shall I proceed with {_format_args(pending_tool_call)}?"
+            
+        _save_state(chat_history=_updated_history(transcript, result["response"]))
         _safe_trace(**result)
         return result
 
-    # 5. Retrieve Context Knowledge (FAQ / Business Info)
     db_knowledge = context.get("knowledge")
     if db_knowledge:
         knowledge_text = await get_context(transcript, [db_knowledge], business_id=business_id)
         if knowledge_text:
             system_prompt += f"\n\n--- BUSINESS KNOWLEDGE ---\n{knowledge_text}"
 
-    # 6. Single-Pass Execution (Dialogue + Tool Decision in ONE Call)
-    tool_schemas = [_build_tool_schema(t) for t in business_tools] if business_tools else None
+    tool_schemas = [_build_tool_schema(t) for t in business_tools] if business_tools else []
+    
+    tool_schemas.append({
+        "type": "function",
+        "function": {
+            "name": "set_call_language",
+            "description": "Call this ONLY when the user explicitly asks to switch the spoken language.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "language": {"type": "string", "enum": ["en", "ml"]}
+                },
+                "required": ["language"]
+            }
+        }
+    })
 
-    # Construct proper multi-turn messages
     messages = [{"role": "system", "content": system_prompt}]
     for msg in chat_history[-4:]:
         messages.append({"role": msg["role"], "content": msg["content"]})
@@ -208,13 +287,12 @@ async def process_turn(
 
     _t_llm = _timed("single_pass_llm")
     llm_kwargs = {
-        "model_name": "fast-model",  # Uses fast Groq Llama-3.3 (300ms)
+        "model_name": "fast-model", 
         "messages": messages,
         "temperature": 0.3,
+        "tools": tool_schemas,
+        "tool_choice": "auto"
     }
-    if tool_schemas:
-        llm_kwargs["tools"] = tool_schemas
-        llm_kwargs["tool_choice"] = "auto"
 
     response, _ = await call_llm(**llm_kwargs)
     _t_llm()
@@ -222,7 +300,6 @@ async def process_turn(
     choice = response.choices[0].message
     tool_calls = getattr(choice, "tool_calls", None)
 
-    # If the LLM triggered a tool:
     if tool_calls:
         call = tool_calls[0]
         tool_name = call.function.name
@@ -233,7 +310,14 @@ async def process_turn(
 
         call_args["_tool_name"] = tool_name
 
-        # Check required fields
+        if tool_name == "set_call_language":
+            new_lang = call_args.get("language", "en")
+            result["language_switch_requested"] = new_lang
+            result["response"] = "ശരി, ഞാൻ ഇനി മലയാളത്തിൽ സംസാരിക്കാം." if new_lang == "ml" else "Sure, I will speak in English now."
+            _save_state(chat_history=_updated_history(transcript, result["response"]), call_language=new_lang)
+            _safe_trace(**result)
+            return result
+
         matching_tool = next((t for t in business_tools if t.tool_name == tool_name), None)
         missing_required = False
         if matching_tool and isinstance(matching_tool.parameters, dict):
@@ -246,14 +330,18 @@ async def process_turn(
 
         if not missing_required:
             if _tool_requires_confirmation(tool_name, business_tools):
-                result["response"] = (
-                    f"Just to confirm, you would like me to proceed with {tool_name.replace('_', ' ')} "
-                    f"using these details — {_format_args(call_args)}. Is that correct?"
-                )
-                result["session_state"] = {
-                    "pending_tool_call": call_args,
-                    "chat_history": _updated_history(transcript, result["response"]),
-                }
+                if call_language == "ml":
+                    result["response"] = (
+                        f"ഉറപ്പുവരുത്താൻ വേണ്ടി, {_format_args(call_args)} ഉപയോഗിച്ച് "
+                        f"ഈ ബുക്കിംഗ് മുന്നോട്ട് കൊണ്ടുപോകട്ടേ?"
+                    )
+                else:
+                    result["response"] = (
+                        f"Just to confirm, you would like me to proceed with {tool_name.replace('_', ' ')} "
+                        f"using these details — {_format_args(call_args)}. Is that correct?"
+                    )
+                
+                _save_state(pending_tool_call=call_args, chat_history=_updated_history(transcript, result["response"]))
                 _safe_trace(**result)
                 return result
             else:
@@ -262,28 +350,35 @@ async def process_turn(
                     tool_result = await execute_tool(tool_name, call_args, business_tools)
                     _t_exec()
                     
-                    # ✅ GRACEFUL ERROR HANDLING FOR AUTO TOOLS
                     if isinstance(tool_result, dict) and tool_result.get("status") == "error":
                         result["tool_called"] = tool_result
-                        result["response"] = (
-                            "I ran into a technical hiccup trying to process that automatically. "
-                            "Let me have someone follow up with you directly."
-                        )
+                        if call_language == "ml":
+                            result["response"] = "ക്ഷമിക്കണം, ഇത് പൂർത്തിയാക്കുന്നതിൽ ഒരു സാങ്കേതിക തകരാർ ഉണ്ട്. ഒരാൾ നിങ്ങളെ നേരിട്ട് വിളിക്കുന്നതാണ്."
+                        else:
+                            result["response"] = (
+                                "I ran into a technical hiccup trying to process that automatically. "
+                                "Let me have someone follow up with you directly."
+                            )
                     else:
                         result["tool_called"] = tool_result
-                        result["response"] = f"Done! I have successfully processed your request for {tool_name.replace('_', ' ')}."
+                        if call_language == "ml":
+                            result["response"] = "ശരി! നിങ്ങളുടെ ബുക്കിംഗ് വിജയകരമായി പൂർത്തിയായി."
+                        else:
+                            result["response"] = f"Done! I have successfully processed your request for {tool_name.replace('_', ' ')}."
                 except Exception as e:
                     _t_exec()
                     logger.error(f"Tool execution exception: {e}")
-                    result["response"] = "I ran into a technical hiccup trying to process that automatically. Let me have someone follow up with you directly."
+                    if call_language == "ml":
+                        result["response"] = "ക്ഷമിക്കണം, ഇത് പൂർത്തിയാക്കുന്നതിൽ ഒരു സാങ്കേതിക തകരാർ ഉണ്ട്. ഒരാൾ നിങ്ങളെ നേരിട്ട് വിളിക്കുന്നതാണ്."
+                    else:
+                        result["response"] = "I ran into a technical hiccup trying to process that automatically. Let me have someone follow up with you directly."
 
-                result["session_state"] = {"chat_history": _updated_history(transcript, result["response"])}
+                _save_state(chat_history=_updated_history(transcript, result["response"]))
                 _safe_trace(**result)
                 return result
 
-    # Regular conversational response
     reply_content = choice.content or "How can I help you today?"
     result["response"] = reply_content.strip()
-    result["session_state"] = {"chat_history": _updated_history(transcript, result["response"])}
+    _save_state(chat_history=_updated_history(transcript, result["response"]))
     _safe_trace(**result)
     return result

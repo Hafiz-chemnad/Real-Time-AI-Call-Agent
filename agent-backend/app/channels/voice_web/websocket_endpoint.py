@@ -19,6 +19,13 @@ async def webrtc_connect_endpoint(request: Request):
     try:
         offer = await request.json()
         pc_id = offer.get("pc_id")
+        business_id = offer.get("business_id")
+
+        if not business_id:
+            return JSONResponse(
+                content={"error": "business_id is required"},
+                status_code=400,
+            )
 
         if pc_id and pc_id in _active_connections:
             connection = _active_connections[pc_id]
@@ -46,7 +53,7 @@ async def webrtc_connect_endpoint(request: Request):
             )
 
             _active_connections[connection.pc_id] = connection
-            asyncio.create_task(run_webrtc_pipeline(transport))
+            asyncio.create_task(run_webrtc_pipeline(transport, business_id))
 
         answer = connection.get_answer()  # sync — no await
         return JSONResponse(content=answer)
