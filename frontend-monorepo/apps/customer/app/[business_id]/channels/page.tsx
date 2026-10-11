@@ -1,5 +1,4 @@
 'use client';
-import { use } from 'react';
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useWorkspaceStore } from '@/store/workspace';
@@ -14,14 +13,7 @@ interface ChannelConfig {
   claimedNumbers: string[];
   forwardingNumber: string;
 }
-export default function ToolsPage({
-  params,
-}: {
-  params: Promise<{ business_id: string }>;
-}) {
-  const { business_id } = use(params);
-  const { activeBusinessId } = useWorkspaceStore();
-  const businessId = activeBusinessId || business_id;
+
 export default function ChannelsPage({ params }: { params: { business_id: string } }) {
   const { activeBusinessId } = useWorkspaceStore();
   const businessId = activeBusinessId || params.business_id;
