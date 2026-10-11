@@ -94,7 +94,7 @@ nltk==3.10.3
 numba==0.67.0
 numpy==2.2.6
 oauthlib==3.3.1
-onnxruntime==1.23.2
+onnxruntime==1.19.2
 openai==2.48.0
 opentelemetry-api==1.44.0
 opentelemetry-exporter-otlp-proto-common==1.44.0
