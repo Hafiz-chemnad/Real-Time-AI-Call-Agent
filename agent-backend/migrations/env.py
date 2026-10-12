@@ -24,7 +24,14 @@ from app.models.knowledge_base import KnowledgeBase
 
 load_dotenv()
 config = context.config
-config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL"))
+# Alembic uses a sync engine, so convert any async/plain URL to the psycopg2 driver.
+_db_url = os.getenv("DATABASE_URL", "")
+for _prefix in ("postgresql+asyncpg://", "postgres://", "postgresql://"):
+    if _db_url.startswith(_prefix):
+        _db_url = "postgresql+psycopg2://" + _db_url[len(_prefix):]
+        break
+# '%' must be escaped for alembic's config parser (e.g. passwords with %)
+config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
