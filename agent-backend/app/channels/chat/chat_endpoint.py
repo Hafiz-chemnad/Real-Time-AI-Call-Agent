@@ -38,7 +38,12 @@ async def handle_chat(
         result = await process_turn(
             transcript=request.transcript,
             session_state=request.session_state,
-            business_id=str(business_id)
+            business_id=str(business_id),
+            # Text chat (WhatsApp ordering, dashboard test widget): the
+            # customer must actually see tool data such as the menu, so the
+            # reply is composed from it. Phone calls don't pass this and keep
+            # their instant canned confirmations.
+            compose_from_tool_result=True,
         )
         return result
     except Exception as e:

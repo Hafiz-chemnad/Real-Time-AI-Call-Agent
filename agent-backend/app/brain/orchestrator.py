@@ -75,12 +75,65 @@ def _build_system_prompt(context: dict) -> str:
     return base
 
 
+async def _reply_from_tool_result(
+    system_prompt: str,
+    chat_history: list,
+    transcript: str,
+    tool_name: str,
+    tool_result: dict,
+    fallback: str,
+) -> str:
+    """Second LLM pass: turns a tool's raw result into the actual reply.
+
+    Without this, a successful tool call produced only a canned "Done!"
+    line and the data the tool returned (a menu, an order id and total, a
+    "location pin still needed" flag) never reached the customer. If this
+    pass fails for any reason, the caller's canned `fallback` is used, so a
+    flaky LLM call can never turn a successful tool call into an error.
+    """
+    try:
+        data = tool_result.get("response", tool_result) if isinstance(tool_result, dict) else tool_result
+        payload = json.dumps(data, default=str, ensure_ascii=False)[:6000]
+
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in chat_history[-4:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": transcript})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"[TOOL RESULT from '{tool_name}' — system data, not written by the customer]\n"
+                f"{payload}\n\n"
+                "Using ONLY the data above, write your reply to the customer now. "
+                "Include the actual details they need: for a menu, every item with its price, one per line; "
+                "for a placed order, the order id and total. "
+                "If the data shows a step the customer still has to do (for example sharing their location pin), "
+                "tell them clearly. Plain text only — no markdown, asterisks or bullet symbols. "
+                "Never invent items, prices or details that are not in the data. Do not call any tools."
+            ),
+        })
+        response, _ = await call_llm(model_name="fast-model", messages=messages, temperature=0.3)
+        text = (response.choices[0].message.content or "").strip()
+        return text or fallback
+    except Exception:
+        logger.exception("Tool-result reply generation failed; using canned reply")
+        return fallback
+
+
 async def process_turn(
     transcript: str,
     session_state: Optional[dict] = None,
-    business_id: str = "11111111-1111-1111-1111-111111111111"
+    business_id: str = "11111111-1111-1111-1111-111111111111",
+    compose_from_tool_result: bool = False,
 ) -> dict:
-    """Processes one caller turn end-to-end with low-latency single-pass LLM reasoning."""
+    """Processes one caller turn end-to-end with low-latency single-pass LLM reasoning.
+
+    compose_from_tool_result: when True, after a tool runs successfully the reply
+    is written by a second LLM pass from the tool's actual data (a menu, an order
+    id/total, ...). Default False keeps the original instant canned confirmations,
+    which is what live phone calls want (no extra latency mid-conversation). Text
+    channels such as WhatsApp chat pass True because the customer needs the data.
+    """
 
     _t_ctx = _timed("get_full_business_context")
     context = await get_full_business_context(business_id)
@@ -201,9 +254,14 @@ async def process_turn(
                 else:
                     result["tool_called"] = tool_result
                     if call_language == "ml":
-                        result["response"] = "ശരി, എല്ലാം തയ്യാറാണ്! നിങ്ങളുടെ ബുക്കിംഗ് വിജയകരമായി പൂർത്തിയായി."
+                        canned = "ശരി, എല്ലാം തയ്യാറാണ്! നിങ്ങളുടെ ബുക്കിംഗ് വിജയകരമായി പൂർത്തിയായി."
                     else:
-                        result["response"] = f"Great, you're all set! I have processed your request for {tool_name.replace('_', ' ')}."
+                        canned = f"Great, you're all set! I have processed your request for {tool_name.replace('_', ' ')}."
+                    result["response"] = canned
+                    if compose_from_tool_result:
+                        result["response"] = await _reply_from_tool_result(
+                            system_prompt, chat_history, transcript, tool_name, tool_result, canned
+                        )
             except Exception as e:
                 _t_exec()
                 logger.error(f"Tool execution exception: {e}")
@@ -362,9 +420,14 @@ async def process_turn(
                     else:
                         result["tool_called"] = tool_result
                         if call_language == "ml":
-                            result["response"] = "ശരി! നിങ്ങളുടെ ബുക്കിംഗ് വിജയകരമായി പൂർത്തിയായി."
+                            canned = "ശരി! നിങ്ങളുടെ ബുക്കിംഗ് വിജയകരമായി പൂർത്തിയായി."
                         else:
-                            result["response"] = f"Done! I have successfully processed your request for {tool_name.replace('_', ' ')}."
+                            canned = f"Done! I have successfully processed your request for {tool_name.replace('_', ' ')}."
+                        result["response"] = canned
+                        if compose_from_tool_result:
+                            result["response"] = await _reply_from_tool_result(
+                                system_prompt, chat_history, transcript, tool_name, tool_result, canned
+                            )
                 except Exception as e:
                     _t_exec()
                     logger.error(f"Tool execution exception: {e}")
