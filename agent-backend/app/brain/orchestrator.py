@@ -1,6 +1,7 @@
 # app/brain/orchestrator.py
 
 import json
+import re
 import logging
 import time
 from typing import Optional, Any
@@ -118,6 +119,19 @@ async def _reply_from_tool_result(
     except Exception:
         logger.exception("Tool-result reply generation failed; using canned reply")
         return fallback
+
+
+_ORDER_CLAIM_RE = re.compile(
+    r"(order\s*(id|number|no\.?)\s*[:#]?\s*\S*\d{5,})|"
+    r"(order\s+(is|has been|was|got)\s+(now\s+)?(confirmed|placed|received))|"
+    r"((i(\'ve| have)|we(\'ve| have))\s+(placed|confirmed)\s+your\s+order)|"
+    r"(order\s+(confirmed|placed))",
+    re.IGNORECASE,
+)
+
+
+def _claims_order_placed(text: str) -> bool:
+    return bool(text and _ORDER_CLAIM_RE.search(text))
 
 
 async def process_turn(
@@ -377,6 +391,14 @@ async def process_turn(
             return result
 
         matching_tool = next((t for t in business_tools if t.tool_name == tool_name), None)
+        # The model cannot know the caller's phone number; the channel does.
+        # When it supplies one in session_state, always use that (never trust
+        # an LLM-invented value).
+        _cust = session_state.get("customer_number")
+        if _cust and matching_tool and isinstance(matching_tool.parameters, dict):
+            if "customerNumber" in (matching_tool.parameters.get("properties") or {}):
+                call_args["customerNumber"] = str(_cust)
+
         missing_required = False
         if matching_tool and isinstance(matching_tool.parameters, dict):
             required = matching_tool.parameters.get("required", [])
@@ -441,6 +463,29 @@ async def process_turn(
                 return result
 
     reply_content = choice.content or "How can I help you today?"
+
+    # Anti-fabrication (chat channels only): no tool ran this turn, so the
+    # model must not claim an order was placed / give an order id or total.
+    if compose_from_tool_result and _claims_order_placed(reply_content):
+        logger.warning("Blocked fabricated order confirmation: %r", reply_content[:200])
+        try:
+            retry_messages = messages + [
+                {"role": "assistant", "content": reply_content},
+                {"role": "system", "content": (
+                    "Your previous reply claimed an order was placed, but no order was created. "
+                    "Orders exist only after the place_order tool returns an order id. Do NOT state "
+                    "an order id or total. Either call place_order now (if you have all details) or "
+                    "ask the customer for whatever is still missing.")},
+            ]
+            retry_resp, _ = await call_llm(**{**llm_kwargs, "messages": retry_messages})
+            rchoice = retry_resp.choices[0].message
+            if getattr(rchoice, "tool_calls", None) or _claims_order_placed(rchoice.content or ""):
+                reply_content = "Just to be sure — could you please confirm your order details (items, and delivery or pickup) so I can place it?"
+            else:
+                reply_content = rchoice.content or reply_content
+        except Exception:
+            reply_content = "Just to be sure — could you please confirm your order details (items, and delivery or pickup) so I can place it?"
+
     result["response"] = reply_content.strip()
     _save_state(chat_history=_updated_history(transcript, result["response"]))
     _safe_trace(**result)
