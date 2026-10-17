@@ -97,7 +97,7 @@ async def _reply_from_tool_result(
         payload = json.dumps(data, default=str, ensure_ascii=False)[:6000]
 
         messages = [{"role": "system", "content": system_prompt}]
-        for msg in chat_history[-4:]:
+        for msg in chat_history[-6:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
         messages.append({"role": "user", "content": transcript})
         messages.append({
@@ -192,11 +192,18 @@ async def process_turn(
         "session_state": {},
     }
 
+    # Text ordering chats need to remember the whole order-taking conversation
+    # (items, quantities, delivery/pickup, location) — a 4-message window made
+    # the AI forget the cart by the time the location pin arrived. Phone calls
+    # keep the original short window for latency.
+    _keep = 24 if compose_from_tool_result else 6
+    _use = 14 if compose_from_tool_result else 4
+
     def _updated_history(user_msg: str, ai_msg: str) -> list:
         return (chat_history + [
             {"role": "user", "content": user_msg},
             {"role": "assistant", "content": ai_msg},
-        ])[-6:]
+        ])[-_keep:]
 
     def _save_state(**kwargs):
         session_state.update(kwargs)
@@ -219,6 +226,11 @@ async def process_turn(
 
     # Bilingual Escalation Handling
     escalation_category = await check_escalation(transcript, custom_escalations, chat_history)
+    # The off-topic classifier is meant for phone receptionists. In an ordering
+    # chat it misfires on item names and short answers (e.g. an item literally
+    # called "hahah"); the system prompt already keeps the AI on topic.
+    if compose_from_tool_result and escalation_category == "off_topic":
+        escalation_category = "none"
     if escalation_category != "none":
         result["escalation"] = escalation_category
         eng_response = get_escalation_response(escalation_category)
@@ -353,7 +365,7 @@ async def process_turn(
     })
 
     messages = [{"role": "system", "content": system_prompt}]
-    for msg in chat_history[-4:]:
+    for msg in chat_history[-_use:]:
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": transcript})
 
