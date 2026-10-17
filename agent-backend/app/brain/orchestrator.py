@@ -198,6 +198,7 @@ async def process_turn(
     # keep the original short window for latency.
     _keep = 24 if compose_from_tool_result else 6
     _use = 14 if compose_from_tool_result else 4
+    _tool_timeout = 25.0 if compose_from_tool_result else 5.0
 
     def _updated_history(user_msg: str, ai_msg: str) -> list:
         return (chat_history + [
@@ -262,7 +263,7 @@ async def process_turn(
             _t_exec = _timed("execute_tool (confirmed)")
             
             try:
-                tool_result = await execute_tool(tool_name, pending_tool_call, business_tools)
+                tool_result = await execute_tool(tool_name, pending_tool_call, business_tools, _tool_timeout)
                 _t_exec()
                 
                 if isinstance(tool_result, dict) and tool_result.get("status") == "error":
@@ -439,7 +440,7 @@ async def process_turn(
             else:
                 _t_exec = _timed("execute_tool (auto)")
                 try:
-                    tool_result = await execute_tool(tool_name, call_args, business_tools)
+                    tool_result = await execute_tool(tool_name, call_args, business_tools, _tool_timeout)
                     _t_exec()
                     
                     if isinstance(tool_result, dict) and tool_result.get("status") == "error":
