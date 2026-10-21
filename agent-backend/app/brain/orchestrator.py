@@ -121,6 +121,39 @@ async def _reply_from_tool_result(
         return fallback
 
 
+ORCHESTRATOR_BUILD = "2026-10-21-order-state"
+
+_LOCATION_MARKER_RE = re.compile(
+    r"^\[Delivery location received\]\s*latitude=(-?[\d.]+),\s*longitude=(-?[\d.]+),\s*address=(.*?)\.\s*Please proceed",
+    re.IGNORECASE | re.DOTALL,
+)
+_DELIVERY_RE = re.compile(r"\b(deliver\w*|home delivery)\b", re.IGNORECASE)
+_PICKUP_RE = re.compile(r"\b(pick\s?up|take\s?away|collect)\b", re.IGNORECASE)
+
+
+def _known_order_facts(session_state: dict, chat_history: list, transcript: str) -> dict:
+    """Facts the CODE knows, so the model never has to re-derive them from a
+    sliding window (the cause of the ask-again loop)."""
+    facts = {}
+    loc = session_state.get("delivery_location")
+    if loc:
+        facts["location"] = loc
+    order_type = None
+    for m in list(chat_history) + [{"role": "user", "content": transcript}]:
+        if m.get("role") != "user":
+            continue
+        text = str(m.get("content", ""))
+        if text.startswith("[Delivery location received]"):
+            continue
+        if _PICKUP_RE.search(text):
+            order_type = "TAKEAWAY"
+        elif _DELIVERY_RE.search(text):
+            order_type = "DELIVERY"
+    if order_type:
+        facts["order_type"] = order_type
+    return facts
+
+
 _ORDER_CLAIM_RE = re.compile(
     r"(order\s*(id|number|no\.?)\s*[:#]?\s*\S*\d{5,})|"
     r"(order\s+(is|has been|was|got)\s+(now\s+)?(confirmed|placed|received))|"
@@ -196,8 +229,8 @@ async def process_turn(
     # (items, quantities, delivery/pickup, location) — a 4-message window made
     # the AI forget the cart by the time the location pin arrived. Phone calls
     # keep the original short window for latency.
-    _keep = 24 if compose_from_tool_result else 6
-    _use = 14 if compose_from_tool_result else 4
+    _keep = 40 if compose_from_tool_result else 6
+    _use = 30 if compose_from_tool_result else 4
     _tool_timeout = 25.0 if compose_from_tool_result else 5.0
 
     def _updated_history(user_msg: str, ai_msg: str) -> list:
@@ -209,6 +242,17 @@ async def process_turn(
     def _save_state(**kwargs):
         session_state.update(kwargs)
         result["session_state"] = session_state
+
+    logger.info("orchestrator build %s (chat_mode=%s)", ORCHESTRATOR_BUILD, compose_from_tool_result)
+
+    if compose_from_tool_result:
+        _m = _LOCATION_MARKER_RE.match(transcript.strip())
+        if _m:
+            session_state["delivery_location"] = {
+                "latitude": float(_m.group(1)),
+                "longitude": float(_m.group(2)),
+                "address": _m.group(3).strip(),
+            }
 
     # Bilingual Prompt Injection Handling
     # Bilingual Prompt Injection Handling
@@ -280,6 +324,8 @@ async def process_turn(
                         )
                 else:
                     result["tool_called"] = tool_result
+                    if tool_name == "place_order":
+                        session_state.pop("delivery_location", None)
                     if call_language == "ml":
                         canned = "ശരി, എല്ലാം തയ്യാറാണ്! നിങ്ങളുടെ ബുക്കിംഗ് വിജയകരമായി പൂർത്തിയായി."
                     else:
@@ -365,6 +411,26 @@ async def process_turn(
         }
     })
 
+    if compose_from_tool_result:
+        _facts = _known_order_facts(session_state, chat_history, transcript)
+        _lines = []
+        if _facts.get("order_type"):
+            _lines.append(f"- The customer already chose {_facts['order_type']}. Do NOT ask delivery-or-pickup again.")
+        if _facts.get("location"):
+            _l = _facts["location"]
+            _lines.append(
+                f"- The customer's delivery location pin HAS BEEN RECEIVED (latitude={_l['latitude']}, "
+                f"longitude={_l['longitude']}). Do NOT ask for it again."
+            )
+        if _lines:
+            system_prompt += (
+                "\n\n[KNOWN FACTS — verified by the system, trust these over your own reading of the chat]\n"
+                + "\n".join(_lines)
+                + "\n- Look at the whole conversation for the items and quantities the customer already chose; "
+                "never ask for something they have already told you. Once items, quantity and delivery/pickup "
+                "are known (and the pin for delivery), call place_order immediately."
+            )
+
     messages = [{"role": "system", "content": system_prompt}]
     for msg in chat_history[-_use:]:
         messages.append({"role": msg["role"], "content": msg["content"]})
@@ -412,6 +478,16 @@ async def process_turn(
             if "customerNumber" in (matching_tool.parameters.get("properties") or {}):
                 call_args["customerNumber"] = str(_cust)
 
+        if tool_name == "place_order" and session_state.get("delivery_location"):
+            _l = session_state["delivery_location"]
+            call_args["latitude"] = _l["latitude"]
+            call_args["longitude"] = _l["longitude"]
+            call_args["deliveryAddress"] = _l["address"]
+        if tool_name == "place_order" and not call_args.get("orderType"):
+            _ot = _known_order_facts(session_state, chat_history, transcript).get("order_type")
+            if _ot:
+                call_args["orderType"] = _ot
+
         missing_required = False
         if matching_tool and isinstance(matching_tool.parameters, dict):
             required = matching_tool.parameters.get("required", [])
@@ -429,10 +505,18 @@ async def process_turn(
                         f"ഈ ബുക്കിംഗ് മുന്നോട്ട് കൊണ്ടുപോകട്ടേ?"
                     )
                 else:
-                    result["response"] = (
-                        f"Just to confirm, you would like me to proceed with {tool_name.replace('_', ' ')} "
-                        f"using these details — {_format_args(call_args)}. Is that correct?"
-                    )
+                    if compose_from_tool_result and tool_name == "place_order":
+                        _items = ", ".join(
+                            f"{i.get('qty', 1)} x {i.get('retailerId', '')}"
+                            for i in (call_args.get("items") or []) if isinstance(i, dict)
+                        )
+                        _how = "delivery to your shared location" if call_args.get("orderType") == "DELIVERY" else "pickup"
+                        result["response"] = f"Just to confirm: {_items} for {_how}. Shall I place the order? (yes / no)"
+                    else:
+                        result["response"] = (
+                            f"Just to confirm, you would like me to proceed with {tool_name.replace('_', ' ')} "
+                            f"using these details — {_format_args(call_args)}. Is that correct?"
+                        )
                 
                 _save_state(pending_tool_call=call_args, chat_history=_updated_history(transcript, result["response"]))
                 _safe_trace(**result)
@@ -454,6 +538,8 @@ async def process_turn(
                             )
                     else:
                         result["tool_called"] = tool_result
+                        if tool_name == "place_order":
+                            session_state.pop("delivery_location", None)
                         if call_language == "ml":
                             canned = "ശരി! നിങ്ങളുടെ ബുക്കിംഗ് വിജയകരമായി പൂർത്തിയായി."
                         else:
