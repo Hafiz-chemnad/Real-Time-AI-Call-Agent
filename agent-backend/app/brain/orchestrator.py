@@ -1,6 +1,7 @@
 # app/brain/orchestrator.py
 
 import json
+import os
 import re
 import logging
 import time
@@ -8,7 +9,7 @@ from typing import Optional, Any
 
 from app.brain.gateway import call_llm
 from app.brain.guardrails.prompt_guardrails import validate_prompt
-from app.brain.guardrails.escalation import check_escalation, get_escalation_response
+from app.brain.guardrails.escalation import check_escalation, get_escalation_response, _regex_precheck
 from app.brain.guardrails.confirmation import classify_confirmation_reply
 from app.brain.tool_decision import _build_tool_schema, decide_correction
 from app.knowledge.selector import get_context
@@ -94,6 +95,16 @@ async def _reply_from_tool_result(
     """
     try:
         data = tool_result.get("response", tool_result) if isinstance(tool_result, dict) else tool_result
+
+        # No LLM call needed for these two — saves tokens (the free Groq tier
+        # allows only 8000 tokens/minute) and can't be garbled or rate-limited.
+        if tool_name == "place_order":
+            return fallback
+        if tool_name == "get_menu":
+            menu_text = _format_menu(data)
+            if menu_text:
+                return menu_text
+
         payload = json.dumps(data, default=str, ensure_ascii=False)[:6000]
 
         messages = [{"role": "system", "content": system_prompt}]
@@ -121,7 +132,37 @@ async def _reply_from_tool_result(
         return fallback
 
 
-ORCHESTRATOR_BUILD = "2026-10-21-order-state"
+ORCHESTRATOR_BUILD = "2026-10-21-lean-tokens"
+
+
+def _format_menu(data) -> Optional[str]:
+    """Builds the menu reply straight from the tool data. Returns None if the
+    data isn't a recognisable list of items (caller then falls back to the LLM)."""
+    items = None
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                items = v
+                break
+    if not items:
+        return None
+    lines = []
+    for it in items:
+        if not isinstance(it, dict) or not it.get("name"):
+            continue
+        if it.get("isAvailable") is False or it.get("is_available") is False:
+            continue
+        price = it.get("price")
+        try:
+            price_txt = f"₹{float(price):g}"
+        except (TypeError, ValueError):
+            price_txt = ""
+        lines.append(f"{it['name']} - {price_txt}".rstrip(" -"))
+    if not lines:
+        return None
+    return "\n".join(lines) + "\n\nWhich item would you like to order?"
 
 _LOCATION_MARKER_RE = re.compile(
     r"^\[Delivery location received\]\s*latitude=(-?[\d.]+),\s*longitude=(-?[\d.]+),\s*address=(.*?)\.\s*Please proceed",
@@ -230,7 +271,7 @@ async def process_turn(
     # the AI forget the cart by the time the location pin arrived. Phone calls
     # keep the original short window for latency.
     _keep = 40 if compose_from_tool_result else 6
-    _use = 30 if compose_from_tool_result else 4
+    _use = 16 if compose_from_tool_result else 4
     _tool_timeout = 25.0 if compose_from_tool_result else 5.0
 
     def _updated_history(user_msg: str, ai_msg: str) -> list:
@@ -270,7 +311,12 @@ async def process_turn(
         return result
 
     # Bilingual Escalation Handling
-    escalation_category = await check_escalation(transcript, custom_escalations, chat_history)
+    if compose_from_tool_result and not custom_escalations:
+        # Chat: regex-only check (human request / clear frustration). Skips an
+        # LLM call per message, which matters on a token-limited free tier.
+        escalation_category = _regex_precheck(transcript) or "none"
+    else:
+        escalation_category = await check_escalation(transcript, custom_escalations, chat_history)
     # The off-topic classifier is meant for phone receptionists. In an ordering
     # chat it misfires on item names and short answers (e.g. an item literally
     # called "hahah"); the system prompt already keeps the AI on topic.
@@ -433,12 +479,16 @@ async def process_turn(
 
     messages = [{"role": "system", "content": system_prompt}]
     for msg in chat_history[-_use:]:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+        _c = str(msg["content"])
+        messages.append({"role": msg["role"], "content": _c[:700] if compose_from_tool_result else _c})
     messages.append({"role": "user", "content": transcript})
 
     _t_llm = _timed("single_pass_llm")
     llm_kwargs = {
-        "model_name": "fast-model", 
+        # Chat uses the higher-limit model (CHAT_LLM_MODEL, default Gemini
+        # "main-model", which falls back to Groq on failure); phone calls stay
+        # on the fast Groq model.
+        "model_name": os.getenv("CHAT_LLM_MODEL", "main-model") if compose_from_tool_result else "fast-model",
         "messages": messages,
         "temperature": 0.3,
         "tools": tool_schemas,
